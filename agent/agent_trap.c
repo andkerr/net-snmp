@@ -576,6 +576,65 @@ convert_v1pdu_to_v2( netsnmp_pdu* template_v1pdu )
 }
 
 /**
+ * Query routing tables to find the interface that traffic to dst will leave
+ * on, and store its IPv4 address string (XXX:XXX:XXX:XXX) in src. Return src on
+ * success and NULL on failure.
+ */
+static char *iproute_get_src(const char (&dst)[INET_ADDRSTRLEN],
+                             char (&src)[INET_ADDRSTRLEN])
+{
+    const char cmd[] = "ip -f inet route get ";
+    char iproute_get[sizeof(cmd) + sizeof(dst)]; /* sizeof includes '\0' */
+    snprintf(iproute_get, sizeof(iproute_get), "%s%s", cmd, dst);
+
+    FILE *fp = popen(iproute_get, "r");
+    if (fp == NULL)
+        return -1;
+
+    char out[256]; // ACK!!! This arbitrary...
+    if (fgets(out, sizeof(out), fp) == NULL) {
+        pclose(fp);
+        return NULL;
+    }
+    pclose(fp);
+
+    const char *delim = " \t\n";
+    for (char *token = strtok(out, delim); token; token = strtok(NULL, delim)) {
+        if (strcmp(token, "src") != 0)
+            continue;
+
+        char *ret = strtok(NULL, delim);
+        return ret ? strcpy(src, ret) : NULL;
+    }
+    return NULL;
+}
+
+/**
+ * Return 0 on success, and a negative value on error (matching the convention
+ * of netsnmp_gethostbyname_v4).
+ */
+static int get_outgoing_ifaddr(const void *data, int len, in_addr_t *addr_out)
+{
+    if (len != sizeof(struct sockaddr_in))
+        return -1;
+
+    struct sockaddr_in *dst_addr = data;
+    char dst[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &dst_addr->sin_addr, dst, sizeof(dststr)) == NULL)
+        return -1;
+
+    char src[INET_ADDRSTRLEN];
+    if (iproute_get_src(dst, src) == NULL)
+        return -1;
+
+    struct in_addr src_addr; /* We don't need a full sockaddr, just IPv4 */
+    if (inet_pton(AF_INET, src, &src_addr) != -1)
+        return -1;
+    memcpy(addr_out, &src_addr.s_addr, sizeof(src_addr.s_addr));
+    return 0;
+}
+
+/**
  * This function allows you to make a distinction between generic 
  * traps from different classes of equipment. For example, you may want 
  * to handle a SNMP_TRAP_LINKDOWN trap for a particular device in a 
@@ -793,6 +852,13 @@ netsnmp_send_traps(int trap, int specific,
            /* "v1trapaddress" was specified in config, try to resolve it */
            res = netsnmp_gethostbyname_v4(v1trapaddress, pdu_in_addr_t);
        }
+#ifdef DYNAMIC_V1TRAPADDRESS
+       if (v1trapaddress == NULL || res < 0) {
+           res = get_outgoing_ifaddr(pdu->transport_data,
+                                     pdu->transport_data_length,
+                                     pdu_in_addr_t);
+       }
+#endif
        if (v1trapaddress == NULL || res < 0) {
            /* "v1trapaddress" was not specified in config or the resolution failed,
             * try any local address */
